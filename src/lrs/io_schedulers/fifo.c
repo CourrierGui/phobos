@@ -219,6 +219,11 @@ static struct lrs_dev *find_free_device(GPtrArray *devices)
         struct lrs_dev *d;
 
         d = g_ptr_array_index(devices, i);
+        /* Do not give a non sched ready device as it could be a device
+         * used for the current allocation. Giving a sched_ready device
+         * ensures that we won't accidently give up a device used for this
+         * allocation.
+         */
         if (dev_is_sched_ready(d))
             return d;
     }
@@ -267,6 +272,7 @@ static int find_read_device(struct io_scheduler *io_sched,
      * fetch_and_check_medium_info
      */
     medium = reqc->params.rwalloc.media[index].alloc_medium;
+    assert(medium);
 
     *dev = search_in_use_medium(io_sched->io_sched_hdl->global_device_list,
                                 medium->rsc.id.name, medium->rsc.id.library,
@@ -630,6 +636,9 @@ static int fifo_exchange_device(struct io_scheduler *io_sched,
     struct lrs_dev *device_to_remove = args->exchange.desired_device;
     struct lrs_dev *device_to_add = args->exchange.unused_device;
 
+    /* FIXME I don't think fifo should care about this. It should take any device
+     * and simply wait for the end of the current/next I/O.
+     */
     if (!dev_is_sched_ready(device_to_add))
         return 0;
 

@@ -1470,11 +1470,14 @@ static int grouped_remove_device(struct io_scheduler *io_sched,
 }
 
 static struct lrs_dev *find_device_to_remove(struct io_scheduler *io_sched,
-                                             const char *techno)
+                                             const char *techno,
+                                             bool *has_techno)
 {
     size_t shortest_queue = SIZE_MAX;
     struct device *device = NULL;
     int i;
+
+    *has_techno = false;
 
     for (i = 0; i < io_sched->devices->len; i++) {
         struct device *iter = g_ptr_array_index(io_sched->devices, i);
@@ -1482,11 +1485,20 @@ static struct lrs_dev *find_device_to_remove(struct io_scheduler *io_sched,
         if (strcmp(iter->device->ld_technology, techno))
             continue;
 
+        *has_techno = true;
         if (!iter->queue) {
             device = iter;
             break;
         }
 
+        /* FIXME should we really give back devices with pending I/O. This
+         * is suboptimal. The dispatch_algo will retry on each scheduler
+         * loop before we try to reschedule any I/O. So in principle, the
+         * device will eventually finish all the reads of the current queue and
+         * then give back this device. This means that the fair_share repartition
+         * will not be respected as long as this queue is not empty. Which I think
+         * is a better behavior performance wise.
+         */
         if (g_queue_get_length(iter->queue->queue) < shortest_queue) {
             device = iter;
             shortest_queue = g_queue_get_length(iter->queue->queue);
@@ -1528,16 +1540,24 @@ static int grouped_claim_device(struct io_scheduler *io_sched,
                                 enum io_sched_claim_device_type type,
                                 union io_sched_claim_device_args *args)
 {
+    bool has_techno;
+
     switch (type) {
     case IO_SCHED_EXCHANGE:
-    case IO_SCHED_BORROW:
         return grouped_exchange_device(io_sched, args);
+    case IO_SCHED_BORROW:
+        /* Not currently used anyway */
+        return -ENOTSUP;
     case IO_SCHED_TAKE:
         args->take.device =
-            find_device_to_remove(io_sched, args->take.technology);
+            find_device_to_remove(io_sched, args->take.technology,
+                                  &has_techno);
 
         if (!args->take.device)
-            return -ENODEV;
+            /* EBUSY: Notify dispatch_algo that we don't have idle devices to give
+             * back.
+             */
+            return has_techno ? -EBUSY : -ENODEV;
 
         grouped_remove_device(io_sched, args->take.device);
 

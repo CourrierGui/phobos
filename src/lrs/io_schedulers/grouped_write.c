@@ -69,6 +69,10 @@
  * streams on .remove_device to let other streams be scheduled instead. This
  * breaks the current assumption that we don't reorder queues and groupings.
  * But this could be acceptable in the face of a device failure.
+ *
+ * TODO:
+ * - dectect parallelisation based on received request patterns
+ * - merge compatible tags when possible?
  */
 
 #define walloc_grouping(reqc) \

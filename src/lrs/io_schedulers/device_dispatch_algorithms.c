@@ -69,8 +69,9 @@ static int take_devices(struct io_scheduler *io_sched,
         args.take.technology = technology;
 
         rc = io_sched_claim_device(io_sched, IO_SCHED_TAKE, &args);
-        if (rc == -ENODEV)
-            /* the scheduler may not have a device of this technology to return
+        if (rc == -ENODEV || rc == -EBUSY)
+            /* The scheduler may not have a device of this technology to return.
+             * Or its devices are all busy.
              */
             break;
 
@@ -107,7 +108,7 @@ static int give_devices(struct io_scheduler *io_sched,
     current_nb_devices = io_sched_count_device_per_techno(io_sched, technology);
 
     if (current_nb_devices >= nb_devices)
-        /* no device to take */
+        /* no device to give */
         return 0;
 
     /* we need nb_devices - current_nb_devices more devices */
@@ -216,6 +217,12 @@ static int fetch_devices_to_give(struct io_sched_handle *io_sched_hdl,
     return 0;
 }
 
+/* Since some schedulers might hold on to their busy devices, we might
+ * not have enough devices in \p devices_to_give. Since we give devices
+ * to read first, we ensure the read scheduler will have the most
+ * devices. This will give more I/O resources to the reads which is a
+ * good thing to reduce retrieval latency for applications.
+ */
 static int dispatch_devices(struct io_sched_handle *io_sched_hdl,
                             GPtrArray *devices_to_give,
                             struct device_repartition *repartition,
@@ -433,7 +440,7 @@ increment_least_favored_scheduler(struct device_list *device_list,
             format_diff -= max_rwf;
     }
 
-    /* increase the repartition of lowest negative weigth */
+    /* increase the repartition of lowest negative weight */
     if (read_diff < 0 && read_diff < write_diff) {
         if (read_diff < format_diff)
             repartition->nb_reads++;
