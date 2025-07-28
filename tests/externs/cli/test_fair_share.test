@@ -9,9 +9,10 @@ fair_share_sender=$test_dir/externs/cli/test_fair_share
 
 # Test matrix. Each row represents the parameters of one test.
 test_matrix=(
-    # Read algo    write  format
-    "fifo"         "fifo" "fifo"
-    "grouped_read" "fifo" "fifo"
+    # Read algo    write           format
+    "fifo"         "fifo"          "fifo"
+    "grouped_read" "fifo"          "fifo"
+    "fifo"         "grouped_write" "fifo"
 )
 
 function setup()
