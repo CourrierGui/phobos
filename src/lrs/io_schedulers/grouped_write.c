@@ -28,6 +28,7 @@
 #include "pho_types.h"
 #include "schedulers.h"
 
+// TODO add library to list criteria?
 /* Principle of the algorithm:
  *
  * The goal is to group write requests per tag and RAID parameters (e.g.
@@ -69,6 +70,29 @@ struct gw_grouping {
 };
 
 /**
+ * Instances of this structure represent a list of devices that
+ * are used by a queue to push requests. All the streams of a given
+ * queue must have the same number of devices gw_queue::n_media.
+ *
+ * The grouping (i.e. a list of requests of the same grouping)
+ * currently written is associted to a stream. This grouping
+ * is switched with a new one when the list of requests is empty.
+ */
+struct gw_data_stream {
+    /** List of size gw_queue::n_media. Devices used to allocate requests
+     * for this stream
+     */
+    struct lrs_dev **devices;
+    /** The grouping whose requests are currently beeing pushed to the
+     * devices of \p devices. The grouping can be shared amongst different
+     * streams.
+     */
+    struct gw_grouping *grouping;
+    /** Reference back to the queue owning this stream */
+    struct gw_queue *queue;
+};
+
+/**
  * All the requests in an instance of this structure must have the same tags.
  * Requests are grouped and scheduled by number of drives required (e.g. RAID
  * params).
@@ -102,6 +126,8 @@ struct gw_queue {
   /** List of size n_media. Devices used for these requests */
   struct lrs_dev **devices;
 
+  GList *streams;
+
   /**
    * Index of the current medium to allocate in .get_device_medium_pair()
    * Used to detect whether the caller is retrying to allocate a device
@@ -112,6 +138,17 @@ struct gw_queue {
    * of 0.
    */
   size_t alloc_index;
+  // TODO
+  size_t n_requests;
+};
+
+struct gw_grouping_config {
+    /** grouping's name */
+    char *grouping;
+    /** Maximum number of data streams for this grouping */
+    size_t max_streams;
+    /** Current number of streams used for this grouping */
+    size_t current_streams;
 };
 
 struct gw_state {
@@ -137,19 +174,39 @@ struct gw_state {
     /** Request currently being allocated (peek -> get_device_medium_pair ->
      * remove/request cycle)
      */
+    // TODO rename current_request
     struct gw_request *current;
+
+    /** Stream that was allocated during peek_request */
+    struct gw_data_stream *current_stream;
 
     /** List of devices eligible for scheduling a new queue */
     GPtrArray *free_devices;
-
-    /** Hash table to quickly find a queue given a device. */
-    GHashTable *device_to_queue;
 
     /** Devices that have been selected by .get_device_medium_pair. Devices
      * are removed from this list only once the I/O has finished not when the
      * request is removed from the I/O scheduler.
      */
     GPtrArray *busy_devices;
+
+    /** Hash table to quickly find a queue given a device. */
+    GHashTable *device_to_stream;
+
+    /** key = grouping_name, value = struct gw_grouping_config
+     * The config is global to all groupings. If the same grouping
+     * is pushed with different tags or RAID parameters, we need to
+     * ensure that the maximum number of groupings written in parallel
+     * does not exceed the config.
+     */
+    GHashTable *data_streams_config;
+
+    /** If max streams per grouping is not specified, use this
+     * default value instead.
+     */
+    size_t default_max_streams;
+
+    /** minimum size a queue must have before we can consider spliting it */
+    size_t min_reqs_before_split;
 };
 
 static struct gw_grouping *gw_grouping_new(const char *name)
@@ -200,9 +257,15 @@ static int gw_init(struct io_scheduler *io_sched)
     state->ordered_queues = NULL;
     state->queues = g_hash_table_new(glib_wqueue_hash, glib_wqueue_equal);
 
-    state->device_to_queue = g_hash_table_new(g_direct_hash, g_direct_equal);
+    state->device_to_stream = g_hash_table_new(g_direct_hash, g_direct_equal);
     state->free_devices = g_ptr_array_new();
     state->busy_devices = g_ptr_array_new();
+
+    /* TODO load these from config */
+    state->min_reqs_before_split = 2;
+    state->default_max_streams = 1;
+    state->data_streams_config = g_hash_table_new(g_direct_hash,
+                                                  g_direct_equal);
 
     io_sched->private_data = state;
 
@@ -215,7 +278,7 @@ static void gw_fini(struct io_scheduler *io_sched)
 
     g_ptr_array_free(state->free_devices, TRUE);
     g_ptr_array_free(state->busy_devices, TRUE);
-    g_hash_table_destroy(state->device_to_queue);
+    g_hash_table_destroy(state->device_to_stream);
     g_hash_table_destroy(state->queues);
     free(state);
 }
@@ -310,7 +373,28 @@ static struct gw_queue *gw_queue_create(struct gw_state *state,
     return queue;
 }
 
-static struct gw_grouping *get_grouping(struct gw_queue *queue,
+static void setup_grouping_config(struct gw_state *state,
+                                  struct gw_grouping *grouping)
+{
+    struct gw_grouping_config *config;
+
+    config = g_hash_table_lookup(state->data_streams_config,
+                                 grouping->name);
+    if (config)
+        return;
+
+    config = xmalloc(sizeof(*config));
+    // TODO load this from config if found
+    config->max_streams = state->default_max_streams;
+    config->current_streams = 0;
+    config->grouping = xstrdup_safe(grouping->name);
+    g_hash_table_insert(state->data_streams_config,
+                        config->grouping,
+                        config);
+}
+
+static struct gw_grouping *get_grouping(struct gw_state *state,
+                                        struct gw_queue *queue,
                                         const char *name)
 {
     struct gw_grouping *grouping;
@@ -335,10 +419,14 @@ new_grouping:
     else
         queue->no_grouping = grouping;
 
+    setup_grouping_config(state, grouping);
+
     return grouping;
 }
 
-static void gw_queue_push(struct gw_queue *queue, struct req_container *reqc)
+static void gw_queue_push(struct gw_state *state,
+                          struct gw_queue *queue,
+                          struct req_container *reqc)
 {
     struct gw_request *req = xmalloc(sizeof(*req));
     struct gw_grouping *grouping;
@@ -346,7 +434,7 @@ static void gw_queue_push(struct gw_queue *queue, struct req_container *reqc)
     req->reqc = reqc;
     req->queue = queue;
 
-    grouping = get_grouping(queue, walloc_grouping(reqc));
+    grouping = get_grouping(state, queue, walloc_grouping(reqc));
     assert(grouping);
 
     g_queue_push_tail(grouping->requests, req);
@@ -362,6 +450,13 @@ static void remove_grouping(struct gw_queue *queue,
 {
     struct gw_grouping *tmp;
 
+    glist_foreach(iter, queue->streams) {
+        struct gw_data_stream *stream = iter->data;
+
+        if (stream->grouping == grouping)
+            stream->grouping = NULL;
+    }
+
     tmp = g_queue_pop_head(queue->groupings);
     assert(tmp == grouping);
 
@@ -375,31 +470,17 @@ static void remove_grouping(struct gw_queue *queue,
     }
 }
 
-static struct gw_request *gw_queue_pop(struct gw_queue *queue)
+static struct gw_request *gw_stream_pop(struct gw_data_stream *stream)
 {
-    struct gw_grouping *grouping;
     struct gw_request *req;
 
-    grouping = g_queue_peek_head(queue->groupings);
-    if (!grouping)
-        return NULL;
-
-    req = g_queue_pop_head(grouping->requests);
-    if (g_queue_is_empty(grouping->requests))
-        remove_grouping(queue, grouping);
+    req = g_queue_pop_head(stream->grouping->requests);
+    if (g_queue_is_empty(stream->grouping->requests)) {
+        remove_grouping(stream->queue, stream->grouping);
+        stream->grouping = NULL;
+    }
 
     return req;
-}
-
-static struct gw_request *gw_queue_peek(struct gw_queue *queue)
-{
-    struct gw_grouping *grouping;
-
-    grouping = g_queue_peek_head(queue->groupings);
-    if (!grouping)
-        return NULL;
-
-    return g_queue_peek_head(grouping->requests);
 }
 
 static void handle_finished_io(struct gw_state *state)
@@ -440,9 +521,15 @@ static int gw_push_request(struct io_scheduler *io_sched,
         queue = gw_queue_create(state, reqc);
 
     assert(queue);
-    gw_queue_push(queue, reqc);
+    gw_queue_push(state, queue, reqc);
 
     return 0;
+}
+
+static void gw_data_stream_free(struct gw_data_stream *stream)
+{
+    free(stream->devices);
+    free(stream);
 }
 
 static void gw_queue_destroy(struct gw_state *state, struct gw_queue *queue)
@@ -450,11 +537,16 @@ static void gw_queue_destroy(struct gw_state *state, struct gw_queue *queue)
     size_t i;
 
     for (i = 0; i < queue->n_media; i++) {
-        if (!queue->devices[i])
-            continue;
+        glist_foreach(iter, queue->streams) {
+            struct gw_data_stream *stream = iter->data;
 
-        g_ptr_array_add(state->free_devices, queue->devices[i]);
-        g_hash_table_remove(state->device_to_queue, queue->devices[i]);
+            if (!stream->devices[i])
+                continue;
+
+            g_ptr_array_add(state->free_devices, stream->devices[i]);
+            g_hash_table_remove(state->device_to_stream, stream->devices[i]);
+            gw_data_stream_free(stream);
+        }
     }
 
     state->allocated = g_list_remove(state->allocated, queue);
@@ -477,6 +569,7 @@ static int gw_remove_request(struct io_scheduler *io_sched,
                              struct req_container *reqc)
 {
     struct gw_state *state = io_sched->private_data;
+    struct gw_data_stream *stream;
     struct gw_queue *queue;
     struct gw_request *req;
 
@@ -486,11 +579,13 @@ static int gw_remove_request(struct io_scheduler *io_sched,
     else
         queue = state->current->queue;
 
+    stream = state->current_stream;
+
     pho_debug("Request %p will be removed from grouped write scheduler", reqc);
 
     /* reset alloc index for the next requests in the queue */
     queue->alloc_index = queue->n_media;
-    req = gw_queue_pop(queue);
+    req = gw_stream_pop(stream);
     if (!req || (state->current && req != state->current))
         LOG_RETURN(-EINVAL,
                    "Expected request '%p' to be pop'ed from queue, found '%p'",
@@ -524,31 +619,71 @@ static int gw_requeue(struct io_scheduler *io_sched,
     return 0;
 }
 
-static bool max_concurrent_io_reached(struct gw_state *state,
-                                      struct gw_queue *queue)
+static bool stream_busy(struct gw_queue *queue,
+                        struct gw_data_stream *stream)
 {
-    struct gw_request *req = gw_queue_peek(queue);
-    const char *grouping = walloc_grouping(req->reqc);
+    size_t i;
 
-    /* XXX for now, limit concurrent I/O to 1 */
-    return current_write_per_grouping_greater_than_max(state->busy_devices,
-                                                       grouping,
-                                                       1);
+    for (i = 0; i < queue->n_media; i++) {
+        /* gw_streams_next_grouping and gw_alloc_new_stream should make sure
+         * that all streams have a grouping at this point. If not, they are
+         * removed from the queue.
+         */
+        assert(stream->grouping);
+
+        /* at least one device was not allocated for this stream,
+         * it cannot be doing I/O.
+         */
+        if (!stream->devices[i])
+            return false;
+
+        /* At least one device is doing I/O, requests from this stream are
+         * blocked until all devices are available.
+         */
+        if (!dev_is_sched_ready(stream->devices[i]))
+            return true;
+    }
+
+    /* All devices are allocated and none are doing I/O write now, the stream
+     * is not busy.
+     */
+    return false;
 }
 
+static bool can_split_queue(struct gw_state *state, struct gw_queue *queue)
+{
+    if (queue->n_media > state->free_devices->len)
+        /* not enough devices to create a new stream right now */
+        return false;
+
+    /* XXX does this take into account previous splits?
+     * If the queue has 40 requests an min_reqs_before_split is 30, n_request
+     * will still be 40 after the first split probably.
+     * I should probably devide n_requests by the number of current streams.
+     */
+    return queue->n_requests >= state->min_reqs_before_split;
+}
+
+/* This function is called iff at least one stream of \p queue is available. */
 static int gw_queue_next_request(struct gw_state *state,
                                  struct gw_queue *queue,
                                  struct req_container **reqc)
 {
-    struct gw_request *req = gw_queue_peek(queue);
+    struct gw_request *req = NULL;
 
-    if (max_concurrent_io_reached(state, queue)) {
-        *reqc = NULL;
-        return 0;
+    /* find the first non busy stream */
+    glist_foreach(iter, queue->streams) {
+        struct gw_data_stream *stream = iter->data;
+
+        if (!stream_busy(queue, stream)) {
+            req = g_queue_peek_head(stream->grouping->requests);
+            state->current_stream = stream;
+            break;
+        }
     }
 
-    /* On remove, the queue is deleted if empty. We should always have a
-     * request available during peek_request
+    /* Since at least one stream is available and streams are removed when
+     * empty, we must have a request at this point.
      */
     assert(req);
 
@@ -559,14 +694,14 @@ static int gw_queue_next_request(struct gw_state *state,
     return 0;
 }
 
-static int gw_alloc_new_queue(struct gw_state *state)
+static struct gw_queue *gw_alloc_new_queue(struct gw_state *state)
 {
     GList *first = g_list_first(state->ordered_queues);
     struct gw_queue *queue;
 
     if (!first)
         /* no more new requests not already allocated to a device */
-        return -EAGAIN;
+        return NULL;
 
     queue = first->data;
     if (queue->n_media > state->free_devices->len)
@@ -574,30 +709,188 @@ static int gw_alloc_new_queue(struct gw_state *state)
          * smart scheduling policies prior to reaching the LRS. It will not
          * try to see if another queue in the list can fit right now.
          */
-        return -EAGAIN;
+        return NULL;
 
     state->allocated = g_list_append(state->allocated, queue);
     state->ordered_queues = g_list_remove_link(state->ordered_queues, first);
 
-    return 0;
+    return queue;
 }
 
+/* A queue is considered busy if all its streams are. */
 static bool queue_busy(struct gw_state *state,
                        struct gw_queue *queue)
 {
-    size_t i;
-
-    for (i = 0; i < queue->n_media; i++) {
-        if (!queue->devices[i])
+    glist_foreach(iter, queue->streams) {
+        if (!stream_busy(queue, iter->data))
             return false;
-
-        if (!dev_is_sched_ready(queue->devices[i]))
-            return true;
     }
 
-    return false;
+    return true;
 }
 
+static struct gw_grouping_config *
+grouping_get_config(struct gw_state *state, struct gw_grouping *grouping)
+{
+    struct gw_grouping_config *config;
+
+    config = g_hash_table_lookup(state->data_streams_config,
+                                 grouping->name);
+    assert(config);
+
+    return config;
+}
+
+static struct gw_data_stream *
+gw_queue_split(struct gw_state *state, struct gw_queue *queue);
+
+static int gw_alloc_new_stream(struct gw_state *state)
+{
+    struct gw_data_stream *stream;
+    struct gw_queue *queue = NULL;
+
+    /* Find an allocated queue that can be split for the free devices */
+    glist_foreach(iter, state->allocated) {
+        struct gw_queue *q = iter->data;
+
+        if (can_split_queue(state, q)) {
+            queue = q;
+            break;
+        }
+    }
+
+    if (!queue)
+        /* If no queue can be split, find a new queue */
+        queue = gw_alloc_new_queue(state);
+    if (!queue)
+        /* Not enough devices to allocate new requests, try later */
+        return 0;
+
+    stream = gw_queue_split(state, queue);
+
+    state->current_stream = stream;
+    queue->streams = g_list_append(queue->streams, stream);
+    return 0;
+}
+
+static int gw_stream_next_grouping(struct gw_state *state,
+                                   struct gw_queue *queue,
+                                   struct gw_data_stream *stream)
+{
+    struct gw_grouping_config *config;
+    struct gw_grouping *best = NULL;
+    ssize_t max_diff = -1;
+
+
+    glist_foreach(iter, queue->groupings->head) {
+        struct gw_grouping *grouping = iter->data;
+
+        /* We prefer allocating a new grouping over splitting a grouping
+         * across multiple tapes.
+         */
+        config = grouping_get_config(state, grouping);
+        if (config->current_streams == 0) {
+            best = grouping;
+            goto alloc_grouping;
+        }
+    }
+
+    glist_foreach(iter, queue->groupings->head) {
+        struct gw_grouping *grouping = iter->data;
+
+        config = grouping_get_config(state, grouping);
+        /* the loop above garanties that this is always true */
+        assert(config->current_streams > 0);
+
+        if (config->current_streams >= config->max_streams ||
+            g_queue_get_length(grouping->requests) < state->min_reqs_before_split)
+            /* this grouping cannot be split */
+            continue;
+
+        if (max_diff == -1 ||
+            max_diff < (config->max_streams - config->current_streams)) {
+            best = grouping;
+            max_diff = (config->max_streams - config->current_streams);
+        }
+    }
+    if (!best)
+        return -EBUSY;
+
+alloc_grouping:
+    stream->grouping = best;
+    config->current_streams++;
+
+    return 0;
+}
+
+static struct gw_data_stream *
+gw_queue_split(struct gw_state *state, struct gw_queue *queue)
+{
+    struct gw_data_stream *new;
+
+    new = xmalloc(sizeof(*new));
+    new->devices = xcalloc(queue->n_media, sizeof(*new->devices));
+    new->queue = queue;
+    gw_stream_next_grouping(state, queue, new);
+
+    return new;
+}
+
+static void release_stream(struct gw_state *state,
+                           struct gw_data_stream *stream)
+{
+    size_t i;
+
+    stream->queue->streams = g_list_remove(stream->queue->streams, stream);
+    for (i = 0; i < stream->queue->n_media; i++)
+        g_ptr_array_add(state->free_devices, stream->devices[i]);
+
+    free(stream->devices);
+    free(stream);
+}
+
+static void gw_streams_next_grouping(struct gw_state *state)
+{
+    int rc;
+
+    glist_foreach(iter, state->allocated) {
+        struct gw_queue *queue = iter->data;
+
+        glist_foreach(iter2, queue->streams) {
+            struct gw_data_stream *stream = iter2->data;
+
+            /* On .remove_request we make sure to remove the grouping
+             * from all the streams that contain this grouping.
+             * Therefore, grouping != NULL means that the stream's grouping
+             * still has requests.
+             */
+            if (stream->grouping) {
+                assert(g_queue_get_length(stream->grouping->requests) > 0);
+                /* this stream still has requests to manage. */
+                continue;
+            }
+
+            rc = gw_stream_next_grouping(state, queue, stream);
+            if (rc == 0)
+                continue;
+
+            /* cannot find a new grouping or split an existing one */
+            release_stream(state, stream);
+        }
+    }
+}
+
+/**
+ * 1. Find the next grouping to allocate for each stream. It is preferably a new
+ *    grouping of the queue. If they are none left, try to split a grouping. If
+ *    this is still not possible, simply remove the stream.
+ * 2. If some devices are idle, find a new stream to allocate. Note
+ *    that at this stage, we don't actually allocate devices. This
+ *    is done by .get_device_medium_pair().
+ * 3. Find the first non busy queue (i.e. a queue with at least one
+ *    non busy stream) and allocate the first request of the first
+ *    non busy stream.
+ */
 static int gw_peek_request(struct io_scheduler *io_sched,
                            struct req_container **reqc)
 {
@@ -608,9 +901,12 @@ static int gw_peek_request(struct io_scheduler *io_sched,
 
     *reqc = NULL;
 
-    if (state->free_devices->len > 0)
-        gw_alloc_new_queue(state);
+    gw_streams_next_grouping(state);
 
+    if (state->free_devices->len > 0)
+        gw_alloc_new_stream(state);
+
+    /* Find first non busy queue to allocate a new request */
     glist_foreach(iter, state->allocated) {
         queue = iter->data;
         if (!queue_busy(state, queue))
@@ -624,6 +920,7 @@ static int gw_peek_request(struct io_scheduler *io_sched,
         /* All devices are busy, try later. */
         return 0;
 
+    /* find the first request from the queue */
     return gw_queue_next_request(state, queue, reqc);
 }
 
@@ -635,7 +932,8 @@ static struct string_array request_get_tags(struct gw_request *request)
     };
 }
 
-static bool medium_is_ready(struct gw_state *state, struct gw_queue *queue,
+static bool medium_is_ready(struct gw_state *state,
+                            struct gw_data_stream *stream,
                             size_t index)
 {
     struct media_info *medium;
@@ -643,14 +941,14 @@ static bool medium_is_ready(struct gw_state *state, struct gw_queue *queue,
     struct gw_request *first;
     bool compatible;
 
-    assert(queue->devices[index]);
+    assert(stream->devices[index]);
 
-    medium = atomic_dev_medium_get(queue->devices[index]);
+    medium = atomic_dev_medium_get(stream->devices[index]);
     if (!medium)
         return false;
 
-    first = gw_queue_peek(queue);
-    /* An empty queue should not be still there on peek request */
+    first = g_queue_peek_head(stream->grouping->requests);
+    /* An empty stream should not be still there on peek request */
     assert(first);
 
     tags = request_get_tags(first);
@@ -667,6 +965,7 @@ static int gw_get_device_medium_pair(struct io_scheduler *io_sched,
                                      size_t *index)
 {
     struct gw_state *state = io_sched->private_data;
+    struct gw_data_stream *stream;
     struct gw_queue *queue;
     struct gw_request *req;
     int rc;
@@ -674,17 +973,18 @@ static int gw_get_device_medium_pair(struct io_scheduler *io_sched,
     assert(state->current && state->current->reqc == reqc);
 
     req = state->current;
+    stream = state->current_stream;
     queue = req->queue;
 
     if ((queue->alloc_index == queue->n_media ||
         *index > queue->alloc_index) &&
-        queue->devices[*index]) {
+        stream->devices[*index]) {
         /* Queue was allocated to a device for a previous request. Recheck
          * compatibility in case the state of the device or medium has changed.
          * No need to check the device status (e.g. failed), the upper layer will
          * do it for us.
          */
-        if (medium_is_ready(state, queue, *index)) {
+        if (medium_is_ready(state, stream, *index)) {
             queue->alloc_index = *index;
             /* reuse the same device */
             *dev = queue->devices[*index];
@@ -694,20 +994,20 @@ static int gw_get_device_medium_pair(struct io_scheduler *io_sched,
     }
 
     queue->alloc_index = *index;
-    if (queue->devices[*index]) {
+    if (stream->devices[*index]) {
         /* The upper layer wants a different device, remove the previous one. */
-        g_hash_table_remove(state->device_to_queue, queue->devices[*index]);
+        g_hash_table_remove(state->device_to_stream, stream->devices[*index]);
         g_ptr_array_remove(state->busy_devices, queue->devices[*index]);
-        queue->devices[*index] = NULL;
+        stream->devices[*index] = NULL;
     }
 
-    rc = find_write_device(io_sched, req->reqc, &queue->devices[*index], *index,
+    rc = find_write_device(io_sched, req->reqc, &stream->devices[*index], *index,
                            false);
     if (rc)
         return rc;
 
-    *dev = queue->devices[*index];
-    g_hash_table_insert(state->device_to_queue, *dev, queue);
+    *dev = stream->devices[*index];
+    g_hash_table_insert(state->device_to_stream, *dev, stream);
     if (*dev)
         g_ptr_array_add(state->busy_devices, *dev);
 
@@ -767,17 +1067,17 @@ static int gw_remove_device(struct io_scheduler *io_sched,
                             struct lrs_dev *device)
 {
     struct gw_state *state = io_sched->private_data;
-    struct gw_queue *queue;
+    struct gw_data_stream *stream;
 
     /* remove the device from its queue if allocated */
-    queue = g_hash_table_lookup(state->device_to_queue, device);
-    if (queue) {
+    stream = g_hash_table_lookup(state->device_to_stream, device);
+    if (stream) {
         size_t i;
 
-        g_hash_table_remove(state->device_to_queue, device);
-        for (i = 0; i < queue->n_media; i++) {
-            if (queue->devices[i] == device)
-                queue->devices[i] = NULL;
+        g_hash_table_remove(state->device_to_stream, device);
+        for (i = 0; i < stream->queue->n_media; i++) {
+            if (stream->devices[i] == device)
+                stream->devices[i] = NULL;
         }
     }
 
