@@ -82,3 +82,11 @@ function fill_dir()
 
     dd if=/dev/urandom of=$file bs=$block_size count=$nb_block
 }
+
+function tape_only()
+{
+    if [[ ! -e /dev/changer ]]; then
+        echo "this test requires tapes"
+        exit 77
+    fi
+}

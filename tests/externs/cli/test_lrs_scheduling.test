@@ -286,6 +286,19 @@ EOF
     $phobos dir lock "${DIRS[0]}"
 }
 
+function test_grouped_read()
+{
+    tape_only
+
+    waive_lrs
+    export PHOBOS_IO_SCHED_TAPE_read_algo="grouped_read"
+    invoke_lrs
+
+    $phobosd_client -vvv --exit-on-error --stdin << EOF
+quit
+EOF
+}
+
 TESTS=(
     "test_fair_share_conf_at_startup"
     "setup; test_sync_after_put_get; test_conf_set; cleanup"
@@ -294,5 +307,6 @@ TESTS=(
         test_buffered_sync; \
         test_fifo_parallel_write; \
         test_grouped_write_dir; \
+        test_grouped_read; \
      cleanup_phobosd_client"
 )
