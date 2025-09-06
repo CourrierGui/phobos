@@ -738,6 +738,7 @@ static void flush_tosync_array(struct lrs_dev *dev, GPtrArray *tosync_array,
 
         if (is_tosync_ended) {
             if (!req->reqc->params.release.rc) {
+                // pho_info("release %d", req->reqc->req->id);
                 queue_release_response(dev->ld_response_queue, req->reqc);
             }
         } else {
@@ -921,7 +922,7 @@ static void remove_canceled_sync(struct lrs_dev *dev)
     MUTEX_UNLOCK(&dev->ld_mutex);
 }
 
-static void check_needs_sync(struct lrs_dev_hdl *handle, struct lrs_dev *dev)
+void check_needs_sync(struct lrs_dev_hdl *handle, struct lrs_dev *dev)
 {
     struct sync_params *sync_params = &dev->ld_sync_params;
     GPtrArray *tosync_array = sync_params->tosync_array;
@@ -959,6 +960,9 @@ static void check_needs_sync(struct lrs_dev_hdl *handle, struct lrs_dev *dev)
 
     dev->ld_needs_sync = needs_sync || sync_blocking;
     dev->ld_sync_blocking = sync_blocking;
+
+    // dev->ld_needs_sync |= (dev->ld_last_client_rc != 0);
+    // pho_info("needs_sync %p: %s", dev, dev->ld_needs_sync ? "true" : "false");
 
     MUTEX_UNLOCK(&dev->ld_mutex);
 }
@@ -2481,6 +2485,30 @@ static void *lrs_dev_thread(void *tdata)
                          "'%s'): fatal error handling ld_sub_request",
                          rsc_family2str(dev_id->family), dev_id->name,
                          dev_id->library);
+                // pho_info("handle I/O %p", device);
+                // if (pho_request_is_format(req))
+                //     rc = dev_handle_format(device);
+                // else if (pho_request_is_read(req) || pho_request_is_write(req))
+                //     rc = dev_handle_read_write(device);
+                // else {
+                //     const struct pho_id *dev_id = lrs_dev_id(device);
+                //
+                //     pho_error(rc = -EINVAL,
+                //               "device thread (family '%s', name '%s', library "
+                //               "'%s'): invalid type (%s) in ld_sub_request",
+                //               rsc_family2str(dev_id->family), dev_id->name,
+                //               dev_id->library, pho_srl_request_kind_str(req));
+                // }
+                //
+                // if (rc) {
+                //     const struct pho_id *dev_id = lrs_dev_id(device);
+                //
+                //     LOG_GOTO(end_thread, thread->status = rc,
+                //              "device thread (family '%s', name '%s', library "
+                //              "'%s'): fatal error handling ld_sub_request",
+                //              rsc_family2str(dev_id->family), dev_id->name,
+                //              dev_id->library);
+                // }
             }
         }
 
