@@ -675,6 +675,7 @@ static void clean_tosync_array(struct lrs_dev *dev, int rc)
 
         if (is_tosync_ended) {
             if (!req->reqc->params.release.rc) {
+                // pho_info("release %d", req->reqc->req->id);
                 queue_release_response(dev->ld_response_queue, req->reqc);
                 /* If it is a partial request, it means that the client has not
                  * finished writing
@@ -843,7 +844,7 @@ static void remove_canceled_sync(struct lrs_dev *dev)
     MUTEX_UNLOCK(&dev->ld_mutex);
 }
 
-static void check_needs_sync(struct lrs_dev_hdl *handle, struct lrs_dev *dev)
+void check_needs_sync(struct lrs_dev_hdl *handle, struct lrs_dev *dev)
 {
     struct sync_params *sync_params = &dev->ld_sync_params;
 
@@ -861,6 +862,7 @@ static void check_needs_sync(struct lrs_dev_hdl *handle, struct lrs_dev *dev)
      * and medium will be updated accordingly by dev_sync.
      */
     dev->ld_needs_sync |= (dev->ld_last_client_rc != 0);
+    // pho_info("needs_sync %p: %s", dev, dev->ld_needs_sync ? "true" : "false");
     MUTEX_UNLOCK(&dev->ld_mutex);
 }
 
@@ -2294,6 +2296,7 @@ static void *lrs_dev_thread(void *tdata)
             if (device->ld_sub_request) {
                 pho_req_t *req = device->ld_sub_request->reqc->req;
 
+                // pho_info("handle I/O %p", device);
                 if (pho_request_is_format(req))
                     rc = dev_handle_format(device);
                 else if (pho_request_is_read(req) || pho_request_is_write(req))

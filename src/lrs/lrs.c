@@ -650,8 +650,25 @@ static int release_medium(struct lrs_sched *sched,
         push_new_sync_to_device(dev, reqc, medium_index);
 
     /* Acknowledgement of the request */
+    // if (!release->to_sync)
+    //     dev->ld_ongoing_io = false;
     dev_clean_io(dev, reqc->req->release->partial);
+
     MUTEX_UNLOCK(&dev->ld_mutex);
+    // pho_info("ongoing io false %p", dev);
+
+    if (release->to_sync) {
+        /* ownership of reqc is passed to the device thread, no free here */
+        push_new_sync_to_device(dev, reqc, medium_index);
+
+        /* We need to check whether a sync is necessary before setting ongoing_io
+         * to false otherwise there is a race where the scheduler will be able to
+         * schedule an I/O on this device because the device thread has not
+         * checked whether a sync is necessary yet.
+         */
+        // check_needs_sync(&sched->devices, dev);
+        // dev->ld_ongoing_io = false;
+    }
 
     return rc;
 }

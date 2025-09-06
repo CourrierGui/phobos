@@ -444,5 +444,6 @@ bool medium_is_write_compatible(struct media_info *medium,
                                 const char *grouping,
                                 const struct string_array *required_tags,
                                 bool empty_medium);
+void check_needs_sync(struct lrs_dev_hdl *handle, struct lrs_dev *dev);
 
 #endif

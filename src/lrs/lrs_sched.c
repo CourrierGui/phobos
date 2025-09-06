@@ -2005,6 +2005,7 @@ notify_error:
 select_device:
     dev->ld_ongoing_scheduled = true;
     reqc->params.rwalloc.respc->devices[index_to_alloc] = dev;
+    // pho_info("schedule on dev %p", dev);
 
     return 0;
 }
