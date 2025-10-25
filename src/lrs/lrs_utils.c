@@ -377,3 +377,73 @@ void rml_display(struct read_media_list *list)
                   i, list->rml_media[i]->name, list->rml_media[i]->library);
 }
 
+static bool req_grouping_equal(struct req_container *reqc,
+                               const char *grouping)
+{
+    if (!pho_request_is_write(reqc->req))
+        return false;
+
+    if (!grouping)
+        return reqc->req->walloc->grouping == NULL;
+
+    return reqc->req->walloc->grouping &&
+        !strcmp(reqc->req->walloc->grouping, grouping);
+}
+
+static bool ongoing_grouping_equal(const struct lrs_dev *dev,
+                                   const char *grouping)
+{
+    if (!grouping)
+        return dev->ld_ongoing_grouping == NULL;
+
+    if (dev->ld_ongoing_grouping == NULL)
+        return false;
+
+    return !strcmp(dev->ld_ongoing_grouping, grouping);
+}
+
+int n_writes_per_grouping(GPtrArray *devices, const char *grouping)
+{
+    GPtrArray *socket_id_array = g_ptr_array_new();
+    int nb_write = 0;
+    int i;
+
+    for (i = 0; i < devices->len; i++) {
+        struct lrs_dev *dev;
+
+        dev = g_ptr_array_index(devices, i);
+        MUTEX_LOCK(&dev->ld_mutex);
+
+        if ((dev->ld_sub_request &&
+             req_grouping_equal(dev->ld_sub_request->reqc, grouping) &&
+             !g_ptr_array_find(socket_id_array,
+                 (gconstpointer)(intptr_t) dev->ld_sub_request->reqc->socket_id,
+                 NULL)) ||
+
+            (dev->ld_ongoing_io &&
+             ongoing_grouping_equal(dev, grouping) &&
+             !g_ptr_array_find(socket_id_array,
+                 (gconstpointer)(intptr_t) dev->ld_ongoing_socket_id,
+                 NULL))) {
+
+            nb_write++;
+
+            g_ptr_array_add(socket_id_array,
+                            (gpointer)(intptr_t) (dev->ld_sub_request ?
+                                dev->ld_sub_request->reqc->socket_id :
+                                dev->ld_ongoing_socket_id));
+        }
+
+        MUTEX_UNLOCK(&dev->ld_mutex);
+    }
+
+    g_ptr_array_unref(socket_id_array);
+    return nb_write;
+}
+
+bool current_write_per_grouping_greater_than_max(GPtrArray *devices,
+                                                 const char *grouping,
+                                                 int max_grouping)
+{
+    return n_writes_per_grouping(devices, grouping) >= max_grouping;
+}
