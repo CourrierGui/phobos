@@ -377,3 +377,98 @@ void rml_display(struct read_media_list *list)
                   i, list->rml_media[i]->name, list->rml_media[i]->library);
 }
 
+static bool req_grouping_equal(struct req_container *reqc,
+                               const char *grouping)
+{
+    if (!pho_request_is_write(reqc->req))
+        return false;
+
+    if (!grouping)
+        return reqc->req->walloc->grouping == NULL;
+
+    return reqc->req->walloc->grouping &&
+        !strcmp(reqc->req->walloc->grouping, grouping);
+}
+
+static bool client_already_seen(GPtrArray *clients, int socket_id)
+{
+    return g_ptr_array_find(clients, GINT_TO_POINTER(socket_id), NULL);
+}
+
+static void mark_client_seen(GPtrArray *clients, int socket_id)
+{
+    g_ptr_array_add(clients, GINT_TO_POINTER(socket_id));
+}
+
+static inline int count_writes_per_grouping(GHashTable *client_requests,
+                                            GPtrArray *clients,
+                                            const char *grouping)
+{
+    gpointer ongoing_grouping;
+    GHashTableIter iter;
+    gpointer socket_id;
+    int nb_writes = 0;
+
+    g_hash_table_iter_init(&iter, client_requests);
+    while (g_hash_table_iter_next(&iter, &socket_id, &ongoing_grouping)) {
+
+        if (!ongoing_grouping)
+            continue;
+
+        if (!strcmp(ongoing_grouping, grouping) &&
+            !client_already_seen(clients, GPOINTER_TO_INT(socket_id))) {
+
+            mark_client_seen(clients, GPOINTER_TO_INT(socket_id));
+            nb_writes++;
+        }
+    }
+
+    return nb_writes;
+}
+
+int n_writes_per_grouping(GPtrArray *devices, const char *grouping)
+{
+    GPtrArray *clients = g_ptr_array_new();
+    int nb_writes = 0;
+    int i;
+
+    for (i = 0; i < devices->len; i++) {
+        struct lrs_dev *dev;
+
+        dev = g_ptr_array_index(devices, i);
+        MUTEX_LOCK(&dev->ld_mutex);
+
+        /* check arriving request */
+        if (dev->ld_sub_request) {
+            struct req_container *reqc = dev->ld_sub_request->reqc;
+
+            if (req_grouping_equal(reqc, grouping) &&
+                !client_already_seen(clients, reqc->socket_id)) {
+
+                mark_client_seen(clients, reqc->socket_id);
+                nb_writes++;
+            }
+        }
+
+        nb_writes += count_writes_per_grouping(
+            dev->ld_ongoing_io, clients, grouping
+        );
+
+        nb_writes += count_writes_per_grouping(
+            dev->ld_ongoing_partial_io_waiting_sync,
+            clients,
+            grouping
+        );
+        MUTEX_UNLOCK(&dev->ld_mutex);
+    }
+
+    g_ptr_array_unref(clients);
+    return nb_writes;
+}
+
+bool current_write_per_grouping_greater_than_max(GPtrArray *devices,
+                                                 const char *grouping,
+                                                 int max_grouping)
+{
+    return n_writes_per_grouping(devices, grouping) >= max_grouping;
+}

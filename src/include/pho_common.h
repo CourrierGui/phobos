@@ -472,6 +472,23 @@ typedef void(*retry_func_t)(const char *fnname, int rc, int *retry_cnt,
         } while (retry >= 0);                    \
     } while (0)
 
+/** glib's g_str_hash does not support NULL. It can be useful to store
+ * in a single hash table strings that might be NULL (e.g. grouping or tags)
+ */
+static inline guint pho_glib_nullable_str_hash(gconstpointer v)
+{
+    return v ? g_str_hash(v) : g_direct_hash(v);
+}
+
+static inline gboolean pho_glib_nullable_str_equal(gconstpointer lhs,
+                                                   gconstpointer rhs)
+{
+    if (!lhs || !rhs)
+        return lhs == rhs;
+
+    return g_str_equal(lhs, rhs);
+}
+
 /**
  * Phobos-specific type to iterate over a GLib hashtable and stop on error.
  * Propagate the error back.

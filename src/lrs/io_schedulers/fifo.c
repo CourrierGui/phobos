@@ -164,110 +164,11 @@ static int max_write_per_grouping(void)
     return concurrent_write_per_grouping;
 }
 
-static inline bool record_new_write(int *nb_write, int max_grouping,
-                                    GPtrArray *socket_id_array,
-                                    gpointer socket_id)
-{
-    *nb_write += 1;
-    if (*nb_write >= max_grouping)
-        return true;
-
-    g_ptr_array_add(socket_id_array, socket_id);
-    return false;
-}
-
-static inline bool check_ongoing_write(GHashTable *ongoing, int *nb_write,
-                                       int max_grouping, const char *grouping,
-                                       GPtrArray *socket_id_array)
-{
-    gpointer ongoing_grouping;
-    GHashTableIter iter;
-    gpointer socket_id;
-
-    g_hash_table_iter_init(&iter, ongoing);
-    while (g_hash_table_iter_next(&iter, &socket_id, &ongoing_grouping)) {
-        if (ongoing_grouping && !strcmp(ongoing_grouping, grouping) &&
-            !g_ptr_array_find(socket_id_array, socket_id, NULL)) {
-            if (record_new_write(nb_write, max_grouping, socket_id_array,
-                                 socket_id)) {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-static bool req_grouping_equal(struct req_container *reqc,
-                               const char *grouping)
-{
-    if (!pho_request_is_write(reqc->req))
-        return false;
-
-    if (!grouping)
-        return reqc->req->walloc->grouping == NULL;
-
-    return reqc->req->walloc->grouping &&
-        !strcmp(reqc->req->walloc->grouping, grouping);
-}
-
-bool current_write_per_grouping_greater_than_max(GPtrArray *devices,
-                                                 const char *grouping,
-                                                 int max_grouping)
-{
-    GPtrArray *socket_id_array = g_ptr_array_new_full(max_grouping - 1, NULL);
-
-    int nb_write = 0;
-    int i;
-
-    for (i = 0; i < devices->len; i++) {
-        struct lrs_dev *dev;
-
-        dev = g_ptr_array_index(devices, i);
-        MUTEX_LOCK(&dev->ld_mutex);
-        /* check arriving request */
-        if (dev->ld_sub_request &&
-             req_grouping_equal(dev->ld_sub_request->reqc, grouping) &&
-             !g_ptr_array_find(socket_id_array,
-                 GINT_TO_POINTER(dev->ld_sub_request->reqc->socket_id), NULL)) {
-            if (record_new_write(&nb_write, max_grouping, socket_id_array,
-                    GINT_TO_POINTER(dev->ld_sub_request->reqc->socket_id))) {
-                MUTEX_UNLOCK(&dev->ld_mutex);
-                g_ptr_array_unref(socket_id_array);
-                return true;
-            }
-        }
-
-        /* check ongoing io */
-        if (check_ongoing_write(dev->ld_ongoing_io, &nb_write, max_grouping,
-                                grouping, socket_id_array)) {
-            MUTEX_UNLOCK(&dev->ld_mutex);
-            g_ptr_array_unref(socket_id_array);
-            return true;
-        }
-
-        /* check ongoing partial io waiting sync */
-        if (check_ongoing_write(dev->ld_ongoing_partial_io_waiting_sync,
-                                &nb_write, max_grouping, grouping,
-                                socket_id_array)) {
-            MUTEX_UNLOCK(&dev->ld_mutex);
-            g_ptr_array_unref(socket_id_array);
-            return true;
-        }
-
-        MUTEX_UNLOCK(&dev->ld_mutex);
-    }
-
-    g_ptr_array_unref(socket_id_array);
-    return false;
-}
-
 static bool ignore_grouping_on_dir(const struct req_container *reqc)
 {
     return (enum rsc_family)reqc->req->walloc->family == PHO_RSC_DIR &&
            !PHO_CFG_GET_BOOL(cfg_lrs, PHO_CFG_LRS, grouping_on_dir, false);
 }
-
 
 static int fifo_limited_grouping_peek_request(struct io_scheduler *io_sched,
                                               struct req_container **reqc)

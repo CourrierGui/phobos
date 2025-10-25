@@ -191,4 +191,11 @@ enum read_medium_allocation_status rml_errno2status(int rc);
 
 void rml_display(struct read_media_list *list);
 
+int n_writes_per_grouping(GPtrArray *devices, const char *grouping);
+
+bool current_write_per_grouping_greater_than_max(GPtrArray *devices,
+                                                 const char *grouping,
+                                                 int max_grouping);
+
+
 #endif
