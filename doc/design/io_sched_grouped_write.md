@@ -4,6 +4,10 @@ Definitions:
 - *tagset*: the set of tags a tape or write allocation request has;
 - *I/O stream*: set of drives used to write a single object. A RAID4 put uses
   an I/O stream of 3 drives. 2 I/O streams mean 2 puts in parallel.
+- an I/O stream is said to be *idle* when all its devices can accept more
+  requests (current ongoing I/O is strictly lower than the maximum allowed) and
+  the devices are ready for scheduling new I/O (as defined by
+  `dev_is_sched_ready`)
 
 ## Challenges of scheduling writes
 
@@ -54,11 +58,11 @@ Note that this is not necessarily guarantied. If other drives are busy writing
 objects for other groupings/tagsets, only one I/O stream might be available for
 this batch.
 
-Since devices can now support multiple concurrent I/O, we should favor running
+Since dir can now support multiple concurrent I/O, we should favor running
 batches in parallel instead of parallelizing a single batch into multiple I/O
-streams. Given 2 batches that can be split into 2 I/O streams and a single
-device which supports 2 I/O in parallel. It is more fair to run a single stream
-for each batch than 2 I/O streams for a single batch.
+streams. Given 2 batches that can be split into 2 I/O streams and a single dir
+which supports 2 I/O in parallel. It is more fair to run a single stream for
+each batch than 2 I/O streams for a single batch.
 
 ### Resource starvation
 
@@ -68,6 +72,11 @@ way to mitigate this issue in the first implementation is to schedule a
 different batch when a tape becomes full. We schedule new batches in a round
 robin fashion when a tape is full. That way, if we have 10 batches, at worst, a
 batch is scheduled every 10 tape swaps.
+
+Since writing a full tape can still take a long time, we might want to consider
+adding a size threshold after which a queue is swapped with a new one. To reduce
+the overall time requests are waiting, we can also consider scheduling oldest
+queues first.
 
 ### Hardware error management
 
@@ -91,7 +100,7 @@ will be done by `io_scheduler_ops::peek_request()` on the next scheduling pass.
 
 In short, `retry()` will only reschedule a new medium on the same device if
 possible. Any other situation will result in the request being put back in the
-scheduler's queue.
+scheduler's queue along with the I/O stream it belongs to.
 
 ### Pining I/O streams to devices
 
@@ -100,11 +109,22 @@ soon as it is scheduled. This means that `remove_request()` usually destroys the
 queues associated to the request as soon as it is scheduled. If another request
 comes in later, the scheduler has forgotten where the request was scheduled.
 
-A simple way to remove this limitation is to keep the request in the request
-batch and only remove it on the next call to `peek_request`. To achieve this,
-`remove_request` will simply push the request to a queue of removed requests.
-Since the retry and incoming queues are handled before `peek_request` is called,
-the queue will still exist when `push_request` is called.
+One way to remove this limitation is to keep the requests around until the next
+scheduler loop. Since `peek_request` is always called right after
+`remove_request`, we cannot simply keep the requests until the next call to
+`peek_request`. We cannot remove them inside `push_request` since we don't
+know in advance how many times it will be called when popping requests from the
+incoming queue.
+
+A possible solution is to add an epoch number in the `io_sched_handle` struct.
+This number will start at 0 during phobosd's startup. It is increased by one on
+each iteration. When a request is put in the delayed remove list, the current
+epoch is recorded. In `peek_request`, we can remove any request with an epoch
+strictly lower than the current epoch.
+
+This behavior can be ported to the `grouped_read` scheduler as well. So the
+implementation will be added to the generic `io_scheduler` API. The
+`grouped_read` scheduler can later be modified to fix this issue.
 
 ## Implementation considerations
 
